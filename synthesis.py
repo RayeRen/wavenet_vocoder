@@ -30,7 +30,7 @@ from tqdm import tqdm
 import librosa
 
 from wavenet_vocoder.util import is_mulaw_quantize, is_mulaw, is_raw
-
+from wavenet_vocoder.wavenet import xfade_and_unfold
 import audio
 from hparams import hparams
 
@@ -123,8 +123,11 @@ def wavegen(model, length=None, c=None, g=None, initial_value=None,
 
     with torch.no_grad():
         y_hat = model.incremental_forward(
-            initial_input, c=c, g=g, T=length, tqdm=tqdm, softmax=True, quantize=True,
+            None, c=c, g=g, T=length, tqdm=tqdm, softmax=True, quantize=True,
             log_scale_min=hparams.log_scale_min)
+        # y_hat = model.incremental_forward(
+        #     initial_input, c=c, g=g, T=length, tqdm=tqdm, softmax=True, quantize=True,
+        #     log_scale_min=hparams.log_scale_min)
 
     if is_mulaw_quantize(hparams.input_type):
         y_hat = y_hat.max(1)[1].view(-1).long().cpu().data.numpy()
@@ -132,7 +135,8 @@ def wavegen(model, length=None, c=None, g=None, initial_value=None,
     elif is_mulaw(hparams.input_type):
         y_hat = P.inv_mulaw(y_hat.view(-1).cpu().data.numpy(), hparams.quantize_channels)
     else:
-        y_hat = y_hat.view(-1).cpu().data.numpy()
+        y_hat = y_hat.cpu().data.numpy()
+        y_hat = xfade_and_unfold(y_hat[:, 0, :]).reshape(-1).astype(np.float32)
 
     return y_hat
 

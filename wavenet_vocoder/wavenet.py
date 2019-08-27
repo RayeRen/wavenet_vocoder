@@ -58,6 +58,137 @@ def receptive_field_size(total_layers, num_cycles, kernel_size,
     return (kernel_size - 1) * sum(dilations) + 1
 
 
+def pad_tensor(x, pad, side='both'):
+    # NB - this is just a quick method i need right now
+    # i.e., it won't generalise to other shapes/dims
+    b, t, c = x.size()
+    total = t + 2 * pad if side == 'both' else t + pad
+    padded = torch.zeros(b, total, c, device=x.device)
+    if side == 'before' or side == 'both':
+        padded[:, pad:pad + t, :] = x
+    elif side == 'after':
+        padded[:, :t, :] = x
+    return padded
+
+
+voc_target = 10_240  # target number of samples to be generated in each batch entry
+voc_overlap = 512  # number of samples for crossfading between batches
+
+
+def fold_with_overlap(x):
+    ''' Fold the tensor with overlap for quick batched inference.
+        Overlap will be used for crossfading in xfade_and_unfold()
+
+    Args:
+        x (tensor)    : Upsampled conditioning features.
+                        shape=(1, timesteps, features)
+        voc_target (int)  : Target timesteps for each index of batch
+        voc_overlap (int) : Timesteps for both xfade and rnn warmup
+
+    Return:
+        (tensor) : shape=(num_folds, target + 2 * overlap, features)
+
+    Details:
+        x = [[h1, h2, ... hn]]
+
+        Where each h is a vector of conditioning features
+
+        Eg: target=2, overlap=1 with x.size(1)=10
+
+        folded = [[h1, h2, h3, h4],
+                  [h4, h5, h6, h7],
+                  [h7, h8, h9, h10]]
+    '''
+
+    _, total_len, features = x.size()
+
+    # Calculate variables needed
+    num_folds = (total_len - voc_overlap) // (voc_target + voc_overlap)
+    extended_len = num_folds * (voc_overlap + voc_target) + voc_overlap
+    remaining = total_len - extended_len
+
+    # Pad if some time steps poking out
+    if remaining != 0:
+        num_folds += 1
+        padding = voc_target + 2 * voc_overlap - remaining
+        x = pad_tensor(x, padding, side='after')
+
+    folded = torch.zeros(num_folds, voc_target + 2 * voc_overlap, features, device=x.device)
+
+    # Get the values for the folded tensor
+    for i in range(num_folds):
+        start = i * (voc_target + voc_overlap)
+        end = start + voc_target + 2 * voc_overlap
+        folded[i] = x[:, start:end, :]
+
+    return folded
+
+
+def xfade_and_unfold(y):
+    ''' Applies a crossfade and unfolds into a 1d array.
+
+    Args:
+        y (ndarry)    : Batched sequences of audio samples
+                        shape=(num_folds, target + 2 * overlap)
+                        dtype=np.float64
+        voc_overlap (int) : Timesteps for both xfade and rnn warmup
+
+    Return:
+        (ndarry) : audio samples in a 1d array
+                   shape=(total_len)
+                   dtype=np.float64
+
+    Details:
+        y = [[seq1],
+             [seq2],
+             [seq3]]
+
+        Apply a gain envelope at both ends of the sequences
+
+        y = [[seq1_in, seq1_target, seq1_out],
+             [seq2_in, seq2_target, seq2_out],
+             [seq3_in, seq3_target, seq3_out]]
+
+        Stagger and add up the groups of samples:
+
+        [seq1_in, seq1_target, (seq1_out + seq2_in), seq2_target, ...]
+
+    '''
+
+    num_folds, length = y.shape
+    voc_target = length - 2 * voc_overlap
+    total_len = num_folds * (voc_target + voc_overlap) + voc_overlap
+
+    # Need some silence for the rnn warmup
+    silence_len = voc_overlap // 2
+    fade_len = voc_overlap - silence_len
+    silence = np.zeros((silence_len), dtype=np.float64)
+
+    # Equal power crossfade
+    t = np.linspace(-1, 1, fade_len, dtype=np.float64)
+    fade_in = np.sqrt(0.5 * (1 + t))
+    fade_out = np.sqrt(0.5 * (1 - t))
+
+    # Concat the silence to the fades
+    fade_in = np.concatenate([silence, fade_in])
+    fade_out = np.concatenate([fade_out, silence])
+
+    # Apply the gain to the overlap samples
+    y[:, :voc_overlap] *= fade_in
+    y[:, -voc_overlap:] *= fade_out
+
+    unfolded = np.zeros((total_len), dtype=np.float64)
+
+    # Loop to add up all the samples
+    for i in range(num_folds):
+        start = i * (voc_target + voc_overlap)
+        end = start + voc_target + 2 * voc_overlap
+        unfolded[start:end] += y[i]
+
+    return unfolded
+
+
+
 class WaveNet(nn.Module):
     """The WaveNet model that supports local and global conditioning.
 
@@ -279,14 +410,6 @@ class WaveNet(nn.Module):
         # cast to int in case of numpy.int64...
         T = int(T)
 
-        # Global conditioning
-        if g is not None:
-            if self.embed_speakers is not None:
-                g = self.embed_speakers(g.view(B, -1))
-                # (B x gin_channels, 1)
-                g = g.transpose(1, 2)
-                assert g.dim() == 3
-        g_btc = _expand_global_features(B, T, g, bct=False)
 
         # Local conditioning
         if c is not None and self.upsample_conv is not None:
@@ -300,6 +423,18 @@ class WaveNet(nn.Module):
             assert c.size(-1) == T
         if c is not None and c.size(-1) == T:
             c = c.transpose(1, 2).contiguous()
+
+        c = fold_with_overlap(c)
+        B = c.shape[0]
+
+        # Global conditioning
+        if g is not None:
+            if self.embed_speakers is not None:
+                g = self.embed_speakers(g.view(B, -1))
+                # (B x gin_channels, 1)
+                g = g.transpose(1, 2)
+                assert g.dim() == 3
+        g_btc = _expand_global_features(B, T, g, bct=False)
 
         outputs = []
         if initial_input is None:
@@ -317,7 +452,7 @@ class WaveNet(nn.Module):
 
         current_input = initial_input
 
-        for t in tqdm(range(T)):
+        for t in tqdm(range(c.shape[1])):
             if test_inputs is not None and t < test_inputs.size(1):
                 current_input = test_inputs[:, t, :].unsqueeze(1)
             else:
